@@ -32,7 +32,7 @@ into Apple Home, so the family experience is unchanged.
 ## Architecture
 
 ```
-  ESP32+BH1750 ──ESPHome──┐
+  QT Py + VEML7700 ─ESPHome┐
   Hue motion sensors ─────┤
   Hue bulbs ──────────────┼──► Home Assistant ──WebSocket──► luxctl
   Meross bulbs ───────────┤       (Raspberry Pi)            (Python)
@@ -264,23 +264,119 @@ Keep the two existing Hue Motion Sensors — already integrated, and they supply
 occupancy for free.
 
 For additional sensors: the Hue Bridge only pairs Hue and Friends-of-Hue
-certified devices, so any cheaper sensor requires a second Zigbee coordinator.
-Given that a hub is needed regardless, **ESP32 + BH1750 running ESPHome** is the
-recommended addition — roughly $10 per room, mains-powered, continuous readings
-at any chosen interval, and precise control over placement.
+certified devices, so any cheaper Zigbee sensor requires a second coordinator.
+Rather than add a second radio, new sensors are **WiFi nodes running ESPHome**,
+which report into HA directly and can sample at any rate.
 
 Avoid Aqara *motion* sensors for this purpose: they report illuminance bundled
 with a motion event, so an empty room stops reporting light levels precisely
 when the reading matters. The dedicated Aqara Light Sensor T1 does not have this
-problem.
+problem, and remains a reasonable fallback for any location that later proves to
+need battery power.
 
-**Placement will affect results more than sensor cost.** A ceiling sensor
+### Node design
+
+| Part | Item | ~Cost |
+|---|---|---|
+| MCU | Adafruit QT Py ESP32-S2 | $12.50 |
+| Sensor | Adafruit VEML7700 STEMMA QT breakout (4162) | $6 |
+| Link | STEMMA QT cable, 50–500mm | $1 |
+| Power | USB-C | — |
+
+**No soldering and no breadboard.** Both boards carry STEMMA QT connectors, so a
+node is three parts plugged together and flashed. Building the full set is an
+afternoon rather than a project, and a node can be rebuilt or re-sited in
+minutes — which matters, because placement is expected to change repeatedly.
+
+The QT Py is roughly 22×18mm, small enough to hide, and the STEMMA QT cable
+separates sensor from MCU for free. A location needing the ESP32 concealed just
+takes a longer cable — Adafruit's run to 500mm, SparkFun's Qwiic to 1m, and they
+chain. Beyond ~1m an LTC4311 I²C extender (~$3) restores margin. No decision on
+this is required up front; Phase 0 reveals which locations need it.
+
+### Why VEML7700 and not BH1750
+
+The measurement span is roughly five orders of magnitude: a dim room at night is
+2–10 lx, a lit room 100–300 lx, an overcast window 1,000–3,000 lx, direct sun
+50,000–100,000 lx.
+
+| | BH1750 | VEML7700 |
+|---|---|---|
+| Range | 1 – 65,535 lx | 0 – 120,000 lx |
+| Low-end resolution | 1 lx | ~0.0036 lx at max gain |
+| Gain control | manual MTreg | auto gain + integration time |
+| IR rejection | poor | filtered, near eye response |
+
+BH1750 fails at the bottom of that span, where one count of noise on a 6 lx
+reading is a 17% error — and the bottom is where dusk transitions and
+"is this room too dim" decisions live.
+
+IR rejection matters for the calibration model specifically. Sunlight, LED and
+halogen differ sharply in IR content, so a poorly filtered sensor reports
+different lux for the same perceived brightness depending on source. That error
+lands directly in the bulb-contribution coefficients.
+
+**Use the same sensor IC at every location.** Phase 0's deliverable is a
+window-versus-room correlation; mixing ICs contaminates it with spectral
+response differences.
+
+**Fit a diffuser.** A bare sensor facing a window produces a spot reading
+dominated by whether the sun is currently in its field of view — step changes
+that are noise, not signal. A white diffuser (PTFE cap, sanded acrylic, half a
+ping-pong ball) approximates a cosine-corrected reading of overall sky
+brightness.
+
+### Known traps
+
+- **ESP32-S2 requires the esp-idf framework in ESPHome**, not Arduino. One
+  config line; an evening lost without it.
+- **Confirm the STEMMA QT pinout from Adafruit's product page**, including
+  whether the board has an I²C power-enable pin that must be driven high. Several
+  Adafruit ESP32-S2 boards do, and it presents as "sensor not detected".
+- **The VEML7700's I²C address is fixed at 0x10.** Two cannot share a bus despite
+  the daisy-chain connectors. One sensor per node.
+
+### Reference config
+
+```yaml
+esphome:
+  name: south-window-lux
+esp32:
+  board: adafruit_qtpy_esp32s2
+  framework: { type: esp-idf }
+
+i2c: { sda: GPIO41, scl: GPIO40 }   # confirm against Adafruit pinout
+
+sensor:
+  - platform: veml7700
+    address: 0x10
+    update_interval: 15s
+    ambient_light:
+      name: "South Window Lux"
+      filters:
+        - median: { window_size: 5 }
+```
+
+### Battery power is deliberately deferred
+
+Battery life depends entirely on sample rate, and determining the necessary
+sample rate is Phase 0's job. At the 15s interval Phase 0 wants, an ESP32
+re-associating to WiFi every wake lasts weeks at best. If Phase 0 shows daylight
+changes slowly enough for 5-minute sampling, battery becomes straightforward,
+and ESP-NOW in place of WiFi makes it easier again.
+
+Mains power for the experiment. Revisit with data.
+
+### Placement
+
+**Placement will affect results more than sensor choice.** A ceiling sensor
 measures light reflected off the floor; a wall sensor at eye height measures
 something closer to perception; a sensor that can see a lamp will fight it.
-Expect to re-site sensors several times.
+Expect to re-site sensors several times — the node design exists to make that
+cheap.
 
-Prices and model details reflect knowledge current to January 2026 and should be
-confirmed before purchase.
+Prices, model details and pinouts reflect knowledge current to January 2026 and
+should be confirmed before purchase.
 
 ## Phasing
 
@@ -292,11 +388,21 @@ parts of later phases — that is the point — so planning them in detail now w
 be waste.
 
 **Phase 0 — Observe.** ~2 weeks, no control.
-HA on the Pi with the Hue integration; the two existing sensors online. Build
-ESP32+BH1750 nodes in ESPHome — build one and validate placement before
-soldering the rest. Target one south-facing window, one north-facing window, and
-one or two room-centre. luxctl is `ha_client` + `recorder` + tick loop only; the
-dispatcher does not yet exist.
+HA on the Pi with the Hue integration; the two existing sensors online. Assemble
+the ESPHome nodes and site them: one south-facing window, one north-facing
+window, one or two room-centre. luxctl is `ha_client` + `recorder` + tick loop
+only; the dispatcher does not yet exist.
+
+Node bring-up is two stages:
+
+- **Bench** (~30 min). Plug one node together, flash it, confirm readings reach
+  HA. Sanity-check magnitude in four conditions — dark room, lit room, by a
+  window, outdoors in sun. Order of magnitude is what matters; a phone lux app is
+  an adequate reference. Plausible across all four means the node works.
+- **In situ.** Tape nodes where the sensors are wanted and leave them for several
+  days. Deliberately unlovely — this is the placement experiment, and it is where
+  a spot turns out to catch a reflection off a picture frame every afternoon.
+  Enclosures come after placement settles, not before.
 
 *Deliverable:* two weeks of lux at ~15s resolution in SQLite, and the analysis
 that decides the project — correlating window sensors against room sensors. If
