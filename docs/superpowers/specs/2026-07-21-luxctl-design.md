@@ -326,15 +326,32 @@ that are noise, not signal. A white diffuser (PTFE cap, sanded acrylic, half a
 ping-pong ball) approximates a cosine-corrected reading of overall sky
 brightness.
 
+The QT Py ESP32-S2 is single-core at 240MHz with 4MB flash and 2MB PSRAM, and
+has no Bluetooth. Neither matters here: the workload is one I²C read and one
+network publish per interval, and ESP-NOW — the relevant fallback if WiFi
+association ever proves too costly — is WiFi-based, not BLE.
+
+### Two sensors per node, if wanted
+
+The board exposes **two independent I²C buses**: one on the STEMMA QT connector,
+one on the breakout pads. The VEML7700's address is fixed at 0x10 and cannot be
+changed, but two of them on *separate buses* do not conflict. ESPHome supports
+multiple `i2c:` buses with distinct IDs.
+
+So a single node can carry a room-centre and a window sensor. The second sensor
+requires soldering to the pads, so this is an option to reach for where it earns
+its keep, not the default.
+
 ### Known traps
 
 - **ESP32-S2 requires the esp-idf framework in ESPHome**, not Arduino. One
   config line; an evening lost without it.
-- **Confirm the STEMMA QT pinout from Adafruit's product page**, including
-  whether the board has an I²C power-enable pin that must be driven high. Several
-  Adafruit ESP32-S2 boards do, and it presents as "sensor not detected".
-- **The VEML7700's I²C address is fixed at 0x10.** Two cannot share a bus despite
-  the daisy-chain connectors. One sensor per node.
+- **Confirm the STEMMA QT bus GPIO numbers from Adafruit's pinout diagram.** The
+  product description confirms the connector is a separate bus from the breakout
+  pads but does not give pin numbers.
+- The board's controllable power pin gates the **NeoPixel**, not the STEMMA QT
+  bus — unlike the Feather ESP32-S2. No I²C power-enable step is needed. (Do
+  disable the NeoPixel on any node later converted to battery.)
 
 ### Reference config
 
@@ -359,13 +376,26 @@ sensor:
 
 ### Battery power is deliberately deferred
 
-Battery life depends entirely on sample rate, and determining the necessary
-sample rate is Phase 0's job. At the 15s interval Phase 0 wants, an ESP32
-re-associating to WiFi every wake lasts weeks at best. If Phase 0 shows daylight
-changes slowly enough for 5-minute sampling, battery becomes straightforward,
-and ESP-NOW in place of WiFi makes it easier again.
+The board has battery pads on the underside with diode protection (up to 6V in),
+so converting a node later requires no rebuild. Deep sleep draws ~70µA.
 
-Mains power for the experiment. Revisit with data.
+Battery life is dominated not by sleep current but by **WiFi association on each
+wake** — roughly 3s at ~120mA, so about 0.1mAh per reading. That makes sample
+rate the only variable that matters:
+
+| Interval | Consumption | 2000mAh LiPo |
+|---|---|---|
+| 15s (Phase 0 rate) | ~576 mAh/day | ~3.5 days |
+| 5 min | ~30 mAh/day | ~65 days |
+
+A 20× swing, decided entirely by a number Phase 0 exists to measure. Hence:
+**mains power for the experiment, revisit with data.** If the required rate turns
+out to be minutes rather than seconds, battery nodes become straightforward, and
+ESP-NOW in place of WiFi would improve them further by cutting association cost.
+
+Association time varies considerably with signal strength, so treat these as
+order-of-magnitude figures. The conclusion — that 15s sampling rules out battery
+and 5-minute sampling permits it — is not sensitive to the estimate.
 
 ### Placement
 
