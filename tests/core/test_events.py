@@ -150,3 +150,73 @@ def test_parse_light_treats_null_attributes_dict_as_empty():
     assert result is not None
     assert result.is_on is True
     assert result.brightness is None
+
+
+# --- Finding: a malformed (not merely missing) last_updated must be rejected ---
+
+
+def test_parse_lux_rejects_malformed_last_updated():
+    assert parse_lux(lux_state("123.4", last_updated="not-a-timestamp"),
+                     "south_window") is None
+
+
+def test_parse_light_rejects_malformed_last_updated():
+    assert parse_light(light_state("on", last_updated="21/07/2026 10:00"),
+                       "living_room") is None
+
+
+# --- Finding: brightness must be validated the same way lux is ---
+#
+# SQLite stores NaN as NULL, so an unvalidated NaN brightness round-trips as
+# brightness=None — indistinguishable from a light that was off. A brightness
+# outside HA's 0-255 scale is equally unusable. In every case the light is
+# still on; we simply do not know how bright.
+
+
+def test_parse_light_treats_nan_brightness_as_none():
+    state = parse_light(light_state("on", {"brightness": float("nan")}),
+                        "living_room")
+
+    assert state is not None
+    assert state.is_on is True
+    assert state.brightness is None
+
+
+def test_parse_light_treats_string_nan_brightness_as_none():
+    state = parse_light(light_state("on", {"brightness": "nan"}), "living_room")
+
+    assert state is not None
+    assert state.is_on is True
+    assert state.brightness is None
+
+
+def test_parse_light_treats_infinite_brightness_as_none():
+    state = parse_light(light_state("on", {"brightness": "inf"}), "living_room")
+
+    assert state is not None
+    assert state.is_on is True
+    assert state.brightness is None
+
+
+def test_parse_light_treats_negative_brightness_as_none():
+    state = parse_light(light_state("on", {"brightness": -10}), "living_room")
+
+    assert state is not None
+    assert state.is_on is True
+    assert state.brightness is None
+
+
+def test_parse_light_treats_out_of_range_brightness_as_none():
+    state = parse_light(light_state("on", {"brightness": 510}), "living_room")
+
+    assert state is not None
+    assert state.is_on is True
+    assert state.brightness is None
+
+
+def test_parse_light_accepts_the_brightness_range_endpoints():
+    dark = parse_light(light_state("on", {"brightness": 0}), "living_room")
+    full = parse_light(light_state("on", {"brightness": 255}), "living_room")
+
+    assert dark is not None and dark.brightness == 0.0
+    assert full is not None and full.brightness == 1.0

@@ -17,3 +17,7 @@ analysis/out/
 # Secrets
 .env
 secrets.yaml
+
+# Coverage
+.coverage
+htmlcov/
