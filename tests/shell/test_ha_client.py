@@ -204,27 +204,25 @@ async def test_close_resets_subscription_active_flag(ha_url):
     stuck True and get_states() would raise HASubscriptionActiveError forever."""
     client = HAClient(ha_url, GOOD_TOKEN)
     await client.connect()
-    try:
-        # Start a subscription and receive one event (this sets _subscription_active = True)
-        events = client.subscribe_state_changed()
-        await asyncio.wait_for(anext(events), timeout=5)
-        # Abandon the generator without closing it; close() is called next
-        # without awaiting events.aclose()
-        # (The flag should still be True at this point)
 
-        # Now close the client without closing the subscription generator
+    # Start a subscription, take one event, then abandon the generator
+    # without closing it — so its finally block has not run.
+    events = client.subscribe_state_changed()
+    await asyncio.wait_for(anext(events), timeout=5)
+    await client.close()
+
+    # Reconnecting and fetching state must work. If close() had not cleared
+    # the subscription flag, this would raise HASubscriptionActiveError and
+    # the client would be permanently unable to fetch state again.
+    await client.connect()
+    try:
+        states = await client.get_states()
+    finally:
         await client.close()
 
-        # Reconnect to try get_states(); it should NOT raise HASubscriptionActiveError
-        await client.connect()
-        try:
-            # If the flag were not reset, this would raise HASubscriptionActiveError
-            states = await client.get_states()
-            assert len(states) >= 0  # Just verify we got a response
-        finally:
-            await client.close()
-    except HASubscriptionActiveError:
-        pytest.fail("get_states() should not raise HASubscriptionActiveError after close()")
+    assert len(states) == 1
+    assert states[0]["entity_id"] == SAMPLE_STATE["entity_id"]
+    assert states[0]["state"] == SAMPLE_STATE["state"]
 
 
 async def _odd_greeting_handler(websocket):

@@ -77,6 +77,7 @@ def test_records_light_state_when_off(recorder):
 
     states = recorder.lights_for("living_room_main")
 
+    assert len(states) == 1
     assert states[0].is_on is False
     assert states[0].brightness is None
 

@@ -471,3 +471,42 @@ async def test_an_unexpected_greeting_is_retried_rather_than_fatal(
         await runner.record_forever(CONFIG, recorder, "token")
 
     assert len(attempts) >= 3
+
+
+def test_cli_exits_clearly_when_the_token_is_missing(monkeypatch, capsys, tmp_path):
+    """A missing token must produce a readable message, not a traceback --
+    this is the first thing a human hits bringing the service up by hand."""
+    monkeypatch.delenv("LUXCTL_HA_TOKEN", raising=False)
+    monkeypatch.setattr("sys.argv", ["luxctl", "--config", str(tmp_path / "x.toml")])
+
+    with pytest.raises(SystemExit) as exit_info:
+        runner.cli()
+
+    assert "LUXCTL_HA_TOKEN" in str(exit_info.value)
+
+
+def test_cli_reports_a_bad_config_without_a_traceback(monkeypatch, tmp_path):
+    monkeypatch.setenv("LUXCTL_HA_TOKEN", "token")
+    missing = tmp_path / "absent.toml"
+    monkeypatch.setattr("sys.argv", ["luxctl", "--config", str(missing)])
+
+    with pytest.raises(SystemExit) as exit_info:
+        runner.cli()
+
+    message = str(exit_info.value)
+    assert "config error" in message
+    assert "absent.toml" in message
+
+
+def test_cli_never_emits_the_token_into_a_log_record(monkeypatch, tmp_path, caplog):
+    """The token reaches cli() from the environment and is passed onward.
+    It must not reach a log record on any startup path."""
+    secret = "super-secret-token-value"
+    monkeypatch.setenv("LUXCTL_HA_TOKEN", secret)
+    monkeypatch.setattr("sys.argv", ["luxctl", "--config", str(tmp_path / "no.toml")])
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(SystemExit):
+            runner.cli()
+
+    assert secret not in caplog.text

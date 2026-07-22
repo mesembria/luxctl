@@ -44,6 +44,48 @@ typo'd entity ID is caught before it costs two weeks of data.
 Read the coverage table before the correlations. A sensor with low completeness
 had outages, and its correlation figures are not trustworthy.
 
+## Deployment
+
+The token goes in `/etc/luxctl.env`, outside the repository. Never in
+`sensors.toml`, never in the unit file, never anywhere under this checkout.
+
+```bash
+git clone <repo> /home/pi/luxctl
+cd /home/pi/luxctl
+python3 -m venv .venv
+.venv/bin/pip install -e .
+cp sensors.toml.example sensors.toml     # then edit in your entity IDs
+```
+
+Run it in the foreground once before installing the service, and check the
+seeded count and any "not found in Home Assistant" warnings:
+
+```bash
+export LUXCTL_HA_TOKEN="<token>"
+.venv/bin/luxctl --config sensors.toml --db data/luxctl.db --verbose
+```
+
+Then install:
+
+```bash
+printf 'LUXCTL_HA_TOKEN=%s\n' "<token>" | sudo tee /etc/luxctl.env >/dev/null
+sudo chmod 600 /etc/luxctl.env
+sudo cp deploy/luxctl.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now luxctl
+systemctl status luxctl
+```
+
+Verify data is accumulating before starting the two-week clock:
+
+```bash
+sqlite3 data/luxctl.db \
+  "SELECT sensor_id, COUNT(*), MIN(at), MAX(at) FROM readings GROUP BY sensor_id"
+```
+
+One row per configured sensor, counts climbing. A sensor missing from that
+output is not reporting — fix it now, not in a fortnight.
+
 ## Phase 0 checklist
 
 - [ ] Nodes sited, all sensors reporting
