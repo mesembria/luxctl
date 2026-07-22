@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Recorded data — never commit
+*.db
+*.db-wal
+*.db-shm
+data/
+
+# Analysis output
+analysis/out/
+
+# Secrets
+.env
+secrets.yaml
