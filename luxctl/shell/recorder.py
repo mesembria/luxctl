@@ -1,7 +1,7 @@
 """Append-only persistence of observations to SQLite."""
 
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from luxctl.core.types import LightState, SensorReading
@@ -30,15 +30,36 @@ CREATE INDEX IF NOT EXISTS idx_light_states_light_at
 """
 
 
+def _utc_iso(value: datetime, *, field: str) -> str:
+    """Normalise an observation timestamp to a UTC ISO 8601 string.
+
+    All `at` values are stored as UTC text so that lexicographic order
+    (used by ORDER BY at / MAX(at)) always matches chronological order.
+    A naive datetime is rejected outright rather than assumed to be UTC:
+    guessing a timezone on unattended, unrecoverable field data is exactly
+    the kind of silent corruption this recorder must not produce.
+    """
+    if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+        raise ValueError(
+            f"{field} must be a timezone-aware datetime; got naive datetime "
+            f"{value!r}. Refusing to guess a timezone."
+        )
+    return value.astimezone(timezone.utc).isoformat()
+
+
 class Recorder:
     """Appends observations to SQLite. Never updates, never deletes."""
 
     def __init__(self, path: Path):
         self._conn = sqlite3.connect(str(path), isolation_level=None)
-        # WAL keeps writes cheap on SD cards and lets the analysis script
-        # read the database while recording continues.
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.executescript(SCHEMA)
+        try:
+            # WAL keeps writes cheap on SD cards and lets the analysis
+            # script read the database while recording continues.
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.executescript(SCHEMA)
+        except Exception:
+            self._conn.close()
+            raise
 
     def record_reading(self, reading: SensorReading) -> None:
         self._conn.execute(
@@ -47,8 +68,8 @@ class Recorder:
             (
                 reading.sensor_id,
                 reading.lux,
-                reading.at.isoformat(),
-                datetime.now().astimezone().isoformat(),
+                _utc_iso(reading.at, field="reading.at"),
+                datetime.now(timezone.utc).isoformat(),
             ),
         )
 
@@ -61,8 +82,8 @@ class Recorder:
                 state.light_id,
                 1 if state.is_on else 0,
                 state.brightness,
-                state.at.isoformat(),
-                datetime.now().astimezone().isoformat(),
+                _utc_iso(state.at, field="state.at"),
+                datetime.now(timezone.utc).isoformat(),
             ),
         )
 
