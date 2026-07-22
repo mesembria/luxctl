@@ -22,7 +22,25 @@ MAX_MESSAGE_SIZE = 16 * 1024 * 1024
 
 
 class HAAuthError(RuntimeError):
-    """Raised when Home Assistant rejects the access token."""
+    """Raised when Home Assistant rejects the access token.
+
+    This is fatal: retrying with the same bad token cannot succeed, so the
+    caller is expected to stop rather than reconnect. Only genuine credential
+    rejection belongs here -- see HAProtocolError for the retryable case.
+    """
+
+
+class HAProtocolError(RuntimeError):
+    """Raised when Home Assistant says something unexpected during the
+    handshake.
+
+    Deliberately NOT a subclass of HAAuthError. A malformed or unexpected
+    greeting is usually transient -- HA mid-restart, or a reverse proxy
+    answering before HA is ready -- so it must reach the caller's ordinary
+    retry-with-backoff path. Making it an HAAuthError subclass would send it
+    to the fatal handler instead, killing a two-week run over a blip and
+    reporting it as a credentials problem.
+    """
 
 
 class HAConnectionError(RuntimeError):
@@ -59,20 +77,31 @@ class HAClient:
             raise HAConnectionError("connect() must be called before this method")
 
     async def connect(self) -> None:
-        """Open the socket and complete HA's auth handshake."""
+        """Open the socket and complete HA's auth handshake.
+
+        If anything fails after the socket is open, it is closed before the
+        exception propagates. Leaking it would matter: the caller reconnects
+        on a timer for weeks, and an fd leaked per attempt exhausts the
+        process limit long before anyone looks at the logs.
+        """
         self._ws = await websockets.connect(self._url, max_size=MAX_MESSAGE_SIZE)
 
-        greeting = json.loads(await self._ws.recv())
-        if greeting.get("type") != "auth_required":
-            raise HAAuthError(f"unexpected greeting from HA: {greeting}")
+        try:
+            greeting = json.loads(await self._ws.recv())
+            if greeting.get("type") != "auth_required":
+                raise HAProtocolError(f"unexpected greeting from HA: {greeting}")
 
-        await self._ws.send(
-            json.dumps({"type": "auth", "access_token": self._token})
-        )
+            await self._ws.send(
+                json.dumps({"type": "auth", "access_token": self._token})
+            )
 
-        reply = json.loads(await self._ws.recv())
-        if reply.get("type") != "auth_ok":
-            raise HAAuthError(reply.get("message", "authentication failed"))
+            reply = json.loads(await self._ws.recv())
+            if reply.get("type") != "auth_ok":
+                raise HAAuthError(reply.get("message", "authentication failed"))
+        except BaseException:
+            await self._ws.close()
+            self._ws = None
+            raise
 
         log.info("connected to Home Assistant %s", reply.get("ha_version", "?"))
 

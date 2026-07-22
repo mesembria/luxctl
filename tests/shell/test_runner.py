@@ -8,6 +8,7 @@ from luxctl.core.types import SensorReading
 from luxctl.shell import runner
 from luxctl.shell.config import Config, LightConfig, SensorConfig
 from luxctl.shell.recorder import Recorder
+from luxctl.shell.ha_client import HAAuthError, HAProtocolError
 from luxctl.shell.runner import find_stale, route_state
 
 BASE = datetime(2026, 7, 21, 10, 0, tzinfo=timezone.utc)
@@ -301,3 +302,172 @@ async def test_seeding_warns_about_a_configured_entity_ha_did_not_return(
         and "sensor.south_window_lux" in record.getMessage()
         for record in caplog.records
     )
+
+
+class _StreamingClient:
+    """Stand-in for HAClient that seeds a fixed set of states and then
+    delivers a fixed set of state_changed payloads before closing."""
+
+    def __init__(self, states=(), events=()):
+        self._states = list(states)
+        self._events = list(events)
+
+    async def connect(self):
+        pass
+
+    async def get_states(self):
+        return self._states
+
+    async def subscribe_state_changed(self):
+        for event in self._events:
+            yield event
+
+    async def close(self):
+        pass
+
+
+def _ha_state(entity_id, value, attributes=None):
+    return {
+        "entity_id": entity_id,
+        "state": value,
+        "attributes": attributes or {},
+        "last_updated": "2026-07-21T10:00:00+00:00",
+    }
+
+
+async def test_one_failing_entity_does_not_abort_the_recording_cycle(
+    recorder, monkeypatch, caplog
+):
+    """A single entity that blows up while being recorded must not take the
+    whole run down. Without isolation the exception unwinds the cycle, the
+    caller reconnects, re-seeds the same state, and fails identically --
+    an endless loop recording nothing at all, for every sensor."""
+    good = _ha_state("sensor.living_room_lux", "200.0")
+    bad = _ha_state("sensor.south_window_lux", "1234.5")
+
+    real_route_state = runner.route_state
+
+    def exploding_route_state(state, entity_id, config, rec):
+        if entity_id == "sensor.south_window_lux":
+            raise RuntimeError("disk is full")
+        return real_route_state(state, entity_id, config, rec)
+
+    monkeypatch.setattr(runner, "route_state", exploding_route_state)
+    monkeypatch.setattr(
+        runner, "HAClient", lambda url, token: _StreamingClient(states=[bad, good])
+    )
+
+    with caplog.at_level(logging.ERROR):
+        await runner._record_once(CONFIG, recorder, "token")
+
+    # The healthy sensor was still recorded despite its neighbour failing.
+    assert len(recorder.readings_for("living_room")) == 1
+    assert recorder.readings_for("south_window") == []
+    # And the failure names the offending entity, not just "something broke".
+    assert "sensor.south_window_lux" in caplog.text
+
+
+async def test_subscribed_events_are_recorded(recorder, monkeypatch):
+    """The seeding path was covered, but the subscribe->route wiring that
+    actually runs for the whole fortnight was not."""
+    event = {
+        "entity_id": "sensor.south_window_lux",
+        "old_state": None,
+        "new_state": _ha_state("sensor.south_window_lux", "4321.0"),
+    }
+    monkeypatch.setattr(
+        runner, "HAClient", lambda url, token: _StreamingClient(events=[event])
+    )
+
+    await runner._record_once(CONFIG, recorder, "token")
+
+    readings = recorder.readings_for("south_window")
+    assert len(readings) == 1
+    assert readings[0].lux == 4321.0
+
+
+async def test_a_stale_sensor_is_named_in_a_warning(recorder, monkeypatch, caplog):
+    """The staleness warning is the designed defence against a node dying
+    early in a two-week run. Assert the warning itself, not just that
+    find_stale returns something."""
+    recorder.record_reading(SensorReading("south_window", 1.0, BASE))
+
+    async def one_shot_sleep(seconds):
+        one_shot_sleep.calls += 1
+        if one_shot_sleep.calls > 1:
+            raise asyncio.CancelledError()
+
+    one_shot_sleep.calls = 0
+    monkeypatch.setattr(asyncio, "sleep", one_shot_sleep)
+    monkeypatch.setattr(
+        runner, "find_stale", lambda config, rec, now: ["south_window"]
+    )
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(asyncio.CancelledError):
+            await runner._watchdog(CONFIG, recorder)
+
+    assert "south_window" in caplog.text
+
+
+async def test_a_genuine_auth_failure_is_fatal_and_does_not_retry(
+    recorder, monkeypatch
+):
+    """Retrying a rejected token cannot succeed, and hammering HA with bad
+    credentials is worse than stopping."""
+    attempts = []
+
+    class _AuthFailingClient:
+        async def connect(self):
+            attempts.append(1)
+            raise HAAuthError("Invalid access token")
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(runner, "HAClient", lambda url, token: _AuthFailingClient())
+
+    async def fake_watchdog(config, rec):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(runner, "_watchdog", fake_watchdog)
+
+    with pytest.raises(HAAuthError):
+        await runner.record_forever(CONFIG, recorder, "bad-token")
+
+    assert len(attempts) == 1
+
+
+async def test_an_unexpected_greeting_is_retried_rather_than_fatal(
+    recorder, monkeypatch
+):
+    """HA mid-restart, or a proxy answering early, is transient. Treating it
+    as an auth failure would kill a fortnight's run over a blip and blame
+    the credentials."""
+    attempts = []
+
+    class _OddGreetingClient:
+        async def connect(self):
+            attempts.append(1)
+            raise HAProtocolError("unexpected greeting from HA: {'type': 'nope'}")
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(runner, "HAClient", lambda url, token: _OddGreetingClient())
+
+    async def fake_watchdog(config, rec):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(runner, "_watchdog", fake_watchdog)
+
+    async def fake_sleep(seconds):
+        if len(attempts) >= 3:
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner.record_forever(CONFIG, recorder, "token")
+
+    assert len(attempts) >= 3

@@ -9,6 +9,7 @@ from luxctl.shell.ha_client import (
     HAAuthError,
     HAClient,
     HAConnectionError,
+    HAProtocolError,
     HASubscriptionActiveError,
 )
 
@@ -224,3 +225,48 @@ async def test_close_resets_subscription_active_flag(ha_url):
             await client.close()
     except HASubscriptionActiveError:
         pytest.fail("get_states() should not raise HASubscriptionActiveError after close()")
+
+
+async def _odd_greeting_handler(websocket):
+    """Answers the handshake with something HA would never send, then keeps
+    the socket open -- the case that leaks an fd if connect() doesn't clean
+    up after itself."""
+    await websocket.send(json.dumps({"type": "hello_there"}))
+    # Hold the connection open until the client hangs up, rather than
+    # waiting on something that never fires -- otherwise the server can
+    # never shut down and the fixture deadlocks.
+    async for _ in websocket:
+        pass
+
+
+@pytest.fixture
+async def odd_greeting_url():
+    async with websockets.serve(_odd_greeting_handler, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        yield f"ws://127.0.0.1:{port}/api/websocket"
+
+
+async def test_unexpected_greeting_raises_a_retryable_protocol_error(
+    odd_greeting_url,
+):
+    """Must NOT be an HAAuthError: the caller treats those as fatal, so a
+    transient odd greeting would kill a two-week run and blame the token."""
+    client = HAClient(odd_greeting_url, "token")
+
+    with pytest.raises(HAProtocolError) as caught:
+        await client.connect()
+
+    assert not isinstance(caught.value, HAAuthError)
+
+
+async def test_failed_handshake_does_not_leak_the_socket(odd_greeting_url):
+    """The caller reconnects on a timer for weeks. An fd leaked per failed
+    attempt exhausts the process limit long before anyone reads the logs."""
+    client = HAClient(odd_greeting_url, "token")
+
+    with pytest.raises(HAProtocolError):
+        await client.connect()
+
+    # A socket left open would still be assigned; close() must also be safe.
+    assert client._ws is None
+    await client.close()

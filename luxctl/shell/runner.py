@@ -109,6 +109,26 @@ async def _watchdog(config: Config, recorder: Recorder) -> None:
                       WATCHDOG_INTERVAL_S, exc_info=True)
 
 
+def _route_safely(state: dict, entity_id: str, config: Config,
+                  recorder: Recorder) -> bool:
+    """route_state, with one entity's failure isolated from the rest.
+
+    Without this, a single problem entity takes down the whole run. An
+    exception escaping route_state unwinds the recording cycle, and the
+    caller reconnects and re-seeds from the same state -- so a persistent
+    cause (a full SD card, an entity whose payload we mishandle) never
+    clears. The result is an endless reconnect loop recording nothing at
+    all, for every sensor, because of one of them.
+
+    Returns True if the state was recorded.
+    """
+    try:
+        return route_state(state, entity_id, config, recorder)
+    except Exception:
+        log.exception("failed to record entity %s; continuing", entity_id)
+        return False
+
+
 async def _record_once(config: Config, recorder: Recorder, token: str,
                        on_connected=None) -> None:
     """One connect-and-record cycle. Returns when the connection drops.
@@ -131,7 +151,7 @@ async def _record_once(config: Config, recorder: Recorder, token: str,
         seen_entity_ids: set[str] = set()
         for state in await client.get_states():
             seen_entity_ids.add(state["entity_id"])
-            if route_state(state, state["entity_id"], config, recorder):
+            if _route_safely(state, state["entity_id"], config, recorder):
                 seeded += 1
         log.info("seeded %d entities from current state", seeded)
 
@@ -158,7 +178,7 @@ async def _record_once(config: Config, recorder: Recorder, token: str,
             new_state = data.get("new_state")
             if new_state is None:
                 continue
-            route_state(new_state, data["entity_id"], config, recorder)
+            _route_safely(new_state, data["entity_id"], config, recorder)
     finally:
         await client.close()
 
@@ -200,7 +220,12 @@ async def record_forever(config: Config, recorder: Recorder,
             except HAAuthError:
                 raise
             except Exception as error:
-                log.warning("connection failed: %s", error)
+                # Naming the exception class matters: this handler catches
+                # far more than dropped sockets, and calling a database or
+                # protocol error "connection failed" sends the operator to
+                # investigate the network instead of the real cause.
+                log.warning("recording cycle failed (%s): %s",
+                            type(error).__name__, error)
 
             if connected_at is not None:
                 duration = _now() - connected_at
