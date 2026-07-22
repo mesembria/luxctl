@@ -99,3 +99,54 @@ def test_parses_light_off():
 
 def test_rejects_unavailable_light():
     assert parse_light(light_state("unavailable"), "living_room") is None
+
+
+def test_rejects_nan_lux():
+    assert parse_lux(lux_state("nan"), "south_window") is None
+
+
+def test_rejects_positive_infinity_lux():
+    assert parse_lux(lux_state("inf"), "south_window") is None
+
+
+def test_rejects_negative_infinity_lux():
+    assert parse_lux(lux_state("-inf"), "south_window") is None
+
+
+def test_parse_lux_rejects_missing_last_updated_key():
+    state = {
+        "entity_id": "sensor.south_window_lux",
+        "state": "123.4",
+        "attributes": {"unit_of_measurement": "lx"},
+    }
+    assert parse_lux(state, "south_window") is None
+
+
+def test_parse_light_rejects_missing_last_updated_key():
+    state = {
+        "entity_id": "light.living_room",
+        "state": "on",
+        "attributes": {},
+    }
+    assert parse_light(state, "living_room") is None
+
+
+def test_parse_light_treats_non_numeric_brightness_as_none():
+    state = parse_light(
+        light_state("on", {"brightness": "not-a-number"}), "living_room"
+    )
+
+    assert state is not None
+    assert state.is_on is True
+    assert state.brightness is None
+
+
+def test_parse_light_treats_null_attributes_dict_as_empty():
+    state = light_state("on")
+    state["attributes"] = None
+
+    result = parse_light(state, "living_room")
+
+    assert result is not None
+    assert result.is_on is True
+    assert result.brightness is None
