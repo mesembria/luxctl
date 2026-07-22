@@ -119,10 +119,10 @@ class _ScriptedClient:
 
 
 async def test_backoff_resets_after_a_successful_connection(recorder, monkeypatch):
-    """A connection that actually succeeds should reset the reconnect
-    backoff, so a healthy connection followed by a blip reconnects
-    promptly rather than waiting out a backoff grown from earlier,
-    unrelated failures."""
+    """A connection that actually stayed up for a while (not just one that
+    authenticated) should reset the reconnect backoff, so a healthy
+    connection followed by a blip reconnects promptly rather than waiting
+    out a backoff grown from earlier, unrelated failures."""
     behaviors = iter(["fail_connect", "fail_connect", "succeed", "fail_connect"])
 
     def fake_ha_client(url, token):
@@ -137,6 +137,14 @@ async def test_backoff_resets_after_a_successful_connection(recorder, monkeypatc
         await asyncio.Event().wait()
 
     monkeypatch.setattr(runner, "_watchdog", fake_watchdog)
+
+    # The "succeed" client represents a connection that was healthy for a
+    # long time before dropping: it authenticates once, at t=0, and the
+    # cycle only ends (t=HEALTHY_CONNECTION_S + 1) well past the healthy
+    # threshold. Every other cycle fails before ever authenticating, so
+    # the clock is never consulted for them.
+    clock = iter([0.0, runner.HEALTHY_CONNECTION_S + 1])
+    monkeypatch.setattr(runner, "_now", lambda: next(clock))
 
     sleep_calls = []
 
@@ -154,6 +162,68 @@ async def test_backoff_resets_after_a_successful_connection(recorder, monkeypatc
     # so the backoff before the 4th (failing) attempt is reset to 1, not
     # continued at 4.
     assert sleep_calls[:4] == [1, 2, 1, 2]
+
+
+class _FlappingClient:
+    """Authenticates successfully every time, then the connection drops
+    almost immediately -- the "HA is flapping" failure mode. Each cycle
+    sets connected=True, which is exactly what the regression under test
+    conflated with "healthy"."""
+
+    async def connect(self):
+        pass
+
+    async def get_states(self):
+        raise RuntimeError("socket dropped right after auth")
+
+    async def subscribe_state_changed(self):
+        return
+        yield  # pragma: no cover - makes this an async generator
+
+    async def close(self):
+        pass
+
+
+async def test_backoff_escalates_during_a_flapping_connection(recorder, monkeypatch):
+    """Auth succeeding is not the same as the connection being healthy.
+
+    If Home Assistant is flapping -- auth succeeds, then the socket drops a
+    moment later, over and over -- resetting the backoff on every successful
+    auth defeats exponential backoff entirely: it collapses into a fixed
+    1-second reconnect hammer for the life of the run. The backoff must only
+    reset when a connection actually stayed up for a while; a connection
+    that dies moments after authenticating must let the backoff keep
+    escalating toward the cap.
+    """
+    monkeypatch.setattr(runner, "HAClient", lambda url, token: _FlappingClient())
+
+    async def fake_watchdog(config, recorder):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(runner, "_watchdog", fake_watchdog)
+
+    # The clock never advances between a cycle's connect and its failure,
+    # so every connection "lasted" 0 seconds -- nowhere near the healthy
+    # threshold. This is what makes the scenario a flap rather than a
+    # long-healthy connection.
+    monkeypatch.setattr(runner, "_now", lambda: 0.0)
+
+    sleep_calls = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        if len(sleep_calls) >= 5:
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner.record_forever(CONFIG, recorder, "token")
+
+    # Every cycle authenticates successfully and then dies immediately, so
+    # the backoff must keep escalating rather than being reset to 1 before
+    # every sleep.
+    assert sleep_calls[:5] == [1, 2, 4, 8, 16]
 
 
 async def test_watchdog_survives_and_logs_a_raising_iteration(recorder, monkeypatch, caplog):

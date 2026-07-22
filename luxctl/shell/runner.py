@@ -21,6 +21,27 @@ log = logging.getLogger("luxctl")
 WATCHDOG_INTERVAL_S = 60
 MAX_BACKOFF_S = 60
 
+# A connection that stayed up for at least this long, before dropping, is
+# treated as "healthy" and resets the reconnect backoff to 1. Keyed to
+# MAX_BACKOFF_S: a connection that survived longer than the maximum backoff
+# interval was genuinely working, not a fluke. This is deliberately NOT the
+# same thing as "authentication succeeded" -- a flapping Home Assistant
+# (auth succeeds, then the socket drops moments later, repeatedly) must
+# still let the backoff escalate toward the cap, or exponential backoff is
+# defeated for exactly the failure mode it exists to handle.
+HEALTHY_CONNECTION_S = MAX_BACKOFF_S
+
+
+def _now() -> float:
+    """Monotonic clock for measuring connection duration.
+
+    A thin wrapper around the running event loop's own clock (not
+    wall-clock time), kept as a single seam so tests can substitute a
+    controlled fake without racing real sleeps or getting tangled up in
+    unrelated asyncio-internal clock reads on the loop itself.
+    """
+    return asyncio.get_running_loop().time()
+
 
 def route_state(state: dict, entity_id: str, config: Config,
                 recorder: Recorder) -> bool:
@@ -146,21 +167,31 @@ async def record_forever(config: Config, recorder: Recorder,
                          token: str) -> None:
     """Record indefinitely, reconnecting with exponential backoff.
 
-    The backoff grows toward MAX_BACKOFF_S across repeated failures, but
-    is reset to 1 the moment a connection actually succeeds (i.e. HA
-    authenticates us), so a connection that was healthy for days and then
-    hits a single blip reconnects promptly rather than waiting out a cap
-    grown from unrelated, older failures.
+    The backoff grows toward MAX_BACKOFF_S across repeated failures. It is
+    reset to 1 only when a connection actually lasted at least
+    HEALTHY_CONNECTION_S -- not merely when authentication succeeded. Those
+    are different things: if Home Assistant is flapping (auth succeeds,
+    then the socket drops a second later, over and over), every cycle would
+    otherwise reset the backoff right before the sleep, collapsing this
+    into a fixed 1-second reconnect hammer for the life of the run instead
+    of escalating toward the cap. Keying the reset off actual connection
+    duration means a connection healthy for days that hits a single blip
+    still reconnects promptly, while a flapping connection keeps backing
+    off.
+
+    Connection duration is measured with the event loop's monotonic clock
+    (not wall-clock time), so it stays deterministic and testable without
+    real sleeping.
     """
     watchdog = asyncio.create_task(_watchdog(config, recorder))
     backoff = 1
     try:
         while True:
-            connected = False
+            connected_at = None
 
             def mark_connected():
-                nonlocal connected
-                connected = True
+                nonlocal connected_at
+                connected_at = _now()
 
             try:
                 await _record_once(config, recorder, token,
@@ -171,8 +202,10 @@ async def record_forever(config: Config, recorder: Recorder,
             except Exception as error:
                 log.warning("connection failed: %s", error)
 
-            if connected:
-                backoff = 1
+            if connected_at is not None:
+                duration = _now() - connected_at
+                if duration >= HEALTHY_CONNECTION_S:
+                    backoff = 1
 
             log.info("reconnecting in %ds", backoff)
             await asyncio.sleep(backoff)
