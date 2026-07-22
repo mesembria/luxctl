@@ -107,3 +107,61 @@ def test_rejects_missing_ha_url(tmp_path):
 def test_rejects_missing_file(tmp_path):
     with pytest.raises(ConfigError, match="not found"):
         load_config(tmp_path / "absent.toml")
+
+
+def test_rejects_duplicate_sensor_entity_ids(tmp_path):
+    text = VALID.replace(
+        'entity_id = "sensor.living_room_lux"', 'entity_id = "sensor.south_window_lux"'
+    )
+
+    with pytest.raises(ConfigError, match="duplicate.*entity_id.*sensor.south_window_lux"):
+        load_config(write(tmp_path, text))
+
+
+def test_rejects_duplicate_light_entity_ids(tmp_path):
+    text = VALID + (
+        "\n[[lights]]\n"
+        'id = "living_room_secondary"\n'
+        'entity_id = "light.hue_living_1"\n'
+    )
+
+    with pytest.raises(ConfigError, match="duplicate.*entity_id.*light.hue_living_1"):
+        load_config(write(tmp_path, text))
+
+
+def test_rejects_mixed_type_duplicate_sensor_ids(tmp_path):
+    text = VALID.replace('id = "south_window"', "id = 5").replace(
+        'id = "living_room"', 'id = "5"'
+    )
+
+    with pytest.raises(ConfigError, match="duplicate sensor id"):
+        load_config(write(tmp_path, text))
+
+
+def test_rejects_zero_stale_after_s(tmp_path):
+    text = VALID.replace("stale_after_s = 600", "stale_after_s = 0")
+
+    with pytest.raises(ConfigError, match="stale_after_s.*positive.*0"):
+        load_config(write(tmp_path, text))
+
+
+def test_rejects_negative_stale_after_s(tmp_path):
+    text = VALID.replace("stale_after_s = 600", "stale_after_s = -30")
+
+    with pytest.raises(ConfigError, match="stale_after_s.*positive.*-30"):
+        load_config(write(tmp_path, text))
+
+
+def test_rejects_non_integer_stale_after_s(tmp_path):
+    text = VALID.replace("stale_after_s = 600", 'stale_after_s = "soon"')
+
+    with pytest.raises(ConfigError, match="stale_after_s.*integer.*soon"):
+        load_config(write(tmp_path, text))
+
+
+def test_accepts_valid_positive_stale_after_s(tmp_path):
+    text = VALID.replace("stale_after_s = 600", "stale_after_s = 1")
+
+    config = load_config(write(tmp_path, text))
+
+    assert config.stale_after_s == 1
