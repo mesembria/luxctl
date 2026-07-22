@@ -194,3 +194,33 @@ async def test_connect_uses_a_bounded_max_size(ha_url, monkeypatch):
 
     assert captured["max_size"] == ha_client_module.MAX_MESSAGE_SIZE
     assert captured["max_size"] is not None
+
+
+async def test_close_resets_subscription_active_flag(ha_url):
+    """If a subscription generator is abandoned (not closed) and then close()
+    is called on the client, the subscription flag must be reset so that
+    get_states() can be called afterwards. Without this, the flag would be
+    stuck True and get_states() would raise HASubscriptionActiveError forever."""
+    client = HAClient(ha_url, GOOD_TOKEN)
+    await client.connect()
+    try:
+        # Start a subscription and receive one event (this sets _subscription_active = True)
+        events = client.subscribe_state_changed()
+        await asyncio.wait_for(anext(events), timeout=5)
+        # Abandon the generator without closing it; close() is called next
+        # without awaiting events.aclose()
+        # (The flag should still be True at this point)
+
+        # Now close the client without closing the subscription generator
+        await client.close()
+
+        # Reconnect to try get_states(); it should NOT raise HASubscriptionActiveError
+        await client.connect()
+        try:
+            # If the flag were not reset, this would raise HASubscriptionActiveError
+            states = await client.get_states()
+            assert len(states) >= 0  # Just verify we got a response
+        finally:
+            await client.close()
+    except HASubscriptionActiveError:
+        pytest.fail("get_states() should not raise HASubscriptionActiveError after close()")

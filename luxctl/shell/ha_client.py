@@ -123,3 +123,4 @@ class HAClient:
         if self._ws is not None:
             await self._ws.close()
             self._ws = None
+        self._subscription_active = False
