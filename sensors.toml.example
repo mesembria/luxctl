@@ -1,0 +1,35 @@
+# Copy to sensors.toml and fill in your entity IDs.
+# The HA token comes from the LUXCTL_HA_TOKEN environment variable,
+# never from this file.
+
+[ha]
+url = "ws://homeassistant.local:8123/api/websocket"
+
+[watchdog]
+# Warn if a sensor has not reported within this many seconds.
+stale_after_s = 600
+
+# placement is "window" (a daylight reference) or "room" (perceived
+# brightness). The Phase 0 analysis correlates the former against the latter.
+
+[[sensors]]
+id = "south_window"
+entity_id = "sensor.south_window_lux"
+placement = "window"
+
+[[sensors]]
+id = "north_window"
+entity_id = "sensor.north_window_lux"
+placement = "window"
+
+[[sensors]]
+id = "living_room"
+entity_id = "sensor.living_room_lux"
+placement = "room"
+
+# Lights are recorded, never commanded, in Phase 0. They are needed to
+# explain room-sensor movements that were not caused by daylight.
+
+[[lights]]
+id = "living_room_main"
+entity_id = "light.hue_living_1"
