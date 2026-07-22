@@ -12,9 +12,34 @@ import websockets
 
 log = logging.getLogger(__name__)
 
+# HA's get_states response on a large install can exceed the ~1 MiB default
+# frame limit, so we can't leave that default in place. But max_size=None
+# disables the limit entirely, which allows unbounded memory growth on a
+# resource-constrained Pi if a frame is ever unexpectedly huge or corrupt.
+# 16 MiB is a generous bound that comfortably covers real HA installs while
+# still capping worst-case memory use.
+MAX_MESSAGE_SIZE = 16 * 1024 * 1024
+
 
 class HAAuthError(RuntimeError):
     """Raised when Home Assistant rejects the access token."""
+
+
+class HAConnectionError(RuntimeError):
+    """Raised when a method that needs an open socket is called before
+    connect() has succeeded."""
+
+
+class HASubscriptionActiveError(RuntimeError):
+    """Raised by get_states() when a subscribe_state_changed() stream is
+    active on the same connection.
+
+    get_states() reads and discards frames from the socket until it finds
+    its own matching result. If a subscription is also reading from that
+    socket, get_states() would silently steal and drop state_changed
+    events meant for the subscriber. There is exactly one socket and one
+    reader; the two must not be interleaved.
+    """
 
 
 class HAClient:
@@ -23,14 +48,19 @@ class HAClient:
         self._token = token
         self._ws = None
         self._id = 0
+        self._subscription_active = False
 
     def _next_id(self) -> int:
         self._id += 1
         return self._id
 
+    def _require_connected(self) -> None:
+        if self._ws is None:
+            raise HAConnectionError("connect() must be called before this method")
+
     async def connect(self) -> None:
         """Open the socket and complete HA's auth handshake."""
-        self._ws = await websockets.connect(self._url, max_size=None)
+        self._ws = await websockets.connect(self._url, max_size=MAX_MESSAGE_SIZE)
 
         greeting = json.loads(await self._ws.recv())
         if greeting.get("type") != "auth_required":
@@ -48,6 +78,14 @@ class HAClient:
 
     async def get_states(self) -> list[dict]:
         """Fetch the current state of every entity HA knows about."""
+        self._require_connected()
+        if self._subscription_active:
+            raise HASubscriptionActiveError(
+                "get_states() cannot be called while subscribe_state_changed() "
+                "is active on this connection; it would silently discard "
+                "state_changed events meant for the subscription"
+            )
+
         message_id = self._next_id()
         await self._ws.send(json.dumps({"id": message_id, "type": "get_states"}))
 
@@ -63,17 +101,23 @@ class HAClient:
 
         Each yielded dict has keys: entity_id, old_state, new_state.
         """
-        message_id = self._next_id()
-        await self._ws.send(json.dumps({
-            "id": message_id,
-            "type": "subscribe_events",
-            "event_type": "state_changed",
-        }))
+        self._require_connected()
 
-        async for raw in self._ws:
-            message = json.loads(raw)
-            if message.get("type") == "event" and message.get("id") == message_id:
-                yield message["event"]["data"]
+        message_id = self._next_id()
+        self._subscription_active = True
+        try:
+            await self._ws.send(json.dumps({
+                "id": message_id,
+                "type": "subscribe_events",
+                "event_type": "state_changed",
+            }))
+
+            async for raw in self._ws:
+                message = json.loads(raw)
+                if message.get("type") == "event" and message.get("id") == message_id:
+                    yield message["event"]["data"]
+        finally:
+            self._subscription_active = False
 
     async def close(self) -> None:
         if self._ws is not None:
