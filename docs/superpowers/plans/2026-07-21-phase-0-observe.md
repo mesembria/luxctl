@@ -2158,6 +2158,17 @@ Also look at the scatter plots. A high r with an obviously curved scatter means 
 
 ---
 
+## Implementation note (added after execution)
+
+The code blocks in the tasks above are the plan's *starting* code. Every task
+went through review, and several were hardened beyond what is written here —
+non-finite lux rejection, UTC normalisation of stored timestamps, a guard
+against concurrent `get_states()`, duration-based reconnect backoff, per-entity
+seeding warnings, and NaN-backfilled columns for sensors that never reported.
+
+**The committed code is authoritative, not these blocks.** Read the source and
+its tests rather than transcribing from here.
+
 ## Self-review
 
 **Spec coverage.** Phase 0's spec requirements map as follows: HA as device-driver layer → Task 0; ESPHome nodes with two-stage bring-up → Task 0 Steps 4–8; `ha_client` → Task 6; `recorder` → Task 4; the shell/core split → enforced by the Task 2/3 vs 4/5/6/7 division; ~15s resolution to SQLite → Task 0 Step 6 and Task 4; window-vs-room correlation → Task 9. The tick loop is intentionally reduced to a watchdog, documented in "Deviations" above. Nothing in the spec's Phase 0 is unimplemented.
