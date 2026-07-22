@@ -63,29 +63,75 @@ def find_stale(config: Config, recorder: Recorder,
 
 
 async def _watchdog(config: Config, recorder: Recorder) -> None:
+    """Periodically check for stale sensors.
+
+    This is the only mechanism that detects a dead sensor while the
+    recorder is otherwise running normally, so a failure here must never
+    pass unnoticed. Each iteration is individually guarded: an error is
+    logged loudly but the loop keeps going, rather than the watchdog
+    quietly dying while recording continues. The unconditional sleep at
+    the top of the loop means a persistent error is retried at most once
+    per WATCHDOG_INTERVAL_S, never in a tight spin.
+    """
     while True:
         await asyncio.sleep(WATCHDOG_INTERVAL_S)
-        stale = find_stale(config, recorder, now=datetime.now(timezone.utc))
-        if stale:
-            log.warning(
-                "no readings within %ss from: %s",
-                config.stale_after_s,
-                ", ".join(sorted(stale)),
-            )
+        try:
+            stale = find_stale(config, recorder, now=datetime.now(timezone.utc))
+            if stale:
+                log.warning(
+                    "no readings within %ss from: %s",
+                    config.stale_after_s,
+                    ", ".join(sorted(stale)),
+                )
+        except Exception:
+            log.error("watchdog iteration failed; will retry in %ds",
+                      WATCHDOG_INTERVAL_S, exc_info=True)
 
 
-async def _record_once(config: Config, recorder: Recorder, token: str) -> None:
-    """One connect-and-record cycle. Returns when the connection drops."""
+async def _record_once(config: Config, recorder: Recorder, token: str,
+                       on_connected=None) -> None:
+    """One connect-and-record cycle. Returns when the connection drops.
+
+    If given, on_connected() is called with no arguments as soon as the
+    connection is established (HA has authenticated us) and before any
+    seeding or subscribing happens, so a caller can distinguish "we never
+    connected" from "we connected but something later went wrong" — the
+    latter should still count as a healthy connection for reconnect
+    backoff purposes.
+    """
     client = HAClient(config.ha_url, token)
     await client.connect()
+    if on_connected is not None:
+        on_connected()
     try:
         # Seed with current state so every sensor has a value immediately,
         # rather than waiting for its first change.
         seeded = 0
+        seen_entity_ids: set[str] = set()
         for state in await client.get_states():
+            seen_entity_ids.add(state["entity_id"])
             if route_state(state, state["entity_id"], config, recorder):
                 seeded += 1
         log.info("seeded %d entities from current state", seeded)
+
+        # A configured entity_id that HA never reports is the specific
+        # disaster this phase must avoid: it silently records nothing for
+        # the whole run. Name both our stable id and HA's entity_id so a
+        # typo in sensors.toml is obvious from the log alone.
+        for sensor in config.sensors:
+            if sensor.entity_id not in seen_entity_ids:
+                log.warning(
+                    "configured sensor not found in Home Assistant state: "
+                    "%s (entity_id=%s)",
+                    sensor.id, sensor.entity_id,
+                )
+        for light in config.lights:
+            if light.entity_id not in seen_entity_ids:
+                log.warning(
+                    "configured light not found in Home Assistant state: "
+                    "%s (entity_id=%s)",
+                    light.id, light.entity_id,
+                )
 
         async for data in client.subscribe_state_changed():
             new_state = data.get("new_state")
@@ -98,18 +144,35 @@ async def _record_once(config: Config, recorder: Recorder, token: str) -> None:
 
 async def record_forever(config: Config, recorder: Recorder,
                          token: str) -> None:
-    """Record indefinitely, reconnecting with exponential backoff."""
+    """Record indefinitely, reconnecting with exponential backoff.
+
+    The backoff grows toward MAX_BACKOFF_S across repeated failures, but
+    is reset to 1 the moment a connection actually succeeds (i.e. HA
+    authenticates us), so a connection that was healthy for days and then
+    hits a single blip reconnects promptly rather than waiting out a cap
+    grown from unrelated, older failures.
+    """
     watchdog = asyncio.create_task(_watchdog(config, recorder))
     backoff = 1
     try:
         while True:
+            connected = False
+
+            def mark_connected():
+                nonlocal connected
+                connected = True
+
             try:
-                await _record_once(config, recorder, token)
+                await _record_once(config, recorder, token,
+                                   on_connected=mark_connected)
                 log.warning("connection closed by Home Assistant")
             except HAAuthError:
                 raise
             except Exception as error:
                 log.warning("connection failed: %s", error)
+
+            if connected:
+                backoff = 1
 
             log.info("reconnecting in %ds", backoff)
             await asyncio.sleep(backoff)

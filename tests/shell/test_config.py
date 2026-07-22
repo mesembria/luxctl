@@ -165,3 +165,10 @@ def test_accepts_valid_positive_stale_after_s(tmp_path):
     config = load_config(write(tmp_path, text))
 
     assert config.stale_after_s == 1
+
+
+def test_malformed_toml_raises_config_error_not_toml_decode_error(tmp_path):
+    path = write(tmp_path, "[ha\nurl = this is not valid toml at all")
+
+    with pytest.raises(ConfigError, match=r"sensors\.toml"):
+        load_config(path)

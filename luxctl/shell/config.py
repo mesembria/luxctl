@@ -54,8 +54,11 @@ def load_config(path: Path) -> Config:
     if not path.exists():
         raise ConfigError(f"config file not found: {path}")
 
-    with path.open("rb") as handle:
-        raw = tomllib.load(handle)
+    try:
+        with path.open("rb") as handle:
+            raw = tomllib.load(handle)
+    except tomllib.TOMLDecodeError as error:
+        raise ConfigError(f"could not parse {path}: {error}") from error
 
     ha_url = _require(raw.get("ha", {}), "url", "[ha]")
 
