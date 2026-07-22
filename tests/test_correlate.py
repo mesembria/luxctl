@@ -137,3 +137,44 @@ def test_write_plots_handles_zero_lux_readings_without_error(tmp_path):
 
     assert (out_dir / "timeseries.png").exists()
     assert (out_dir / "scatter_south_window_vs_living_room.png").exists()
+
+
+def test_write_plots_uses_symlog_so_zero_lux_readings_render(tmp_path, monkeypatch):
+    """The files existing is not enough — a plain log axis would still have
+    produced them, silently dropping every 0-lux point. Assert the scale."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    from matplotlib.axes import Axes
+
+    scales = []
+    real_x, real_y = Axes.set_xscale, Axes.set_yscale
+
+    def record_x(self, value, **kwargs):
+        scales.append(("x", value, kwargs.get("linthresh")))
+        return real_x(self, value, **kwargs)
+
+    def record_y(self, value, **kwargs):
+        scales.append(("y", value, kwargs.get("linthresh")))
+        return real_y(self, value, **kwargs)
+
+    monkeypatch.setattr(Axes, "set_xscale", record_x)
+    monkeypatch.setattr(Axes, "set_yscale", record_y)
+
+    path = tmp_path / "symlog.db"
+    recorder = Recorder(path)
+    for minute in range(10):
+        at = BASE + timedelta(minutes=minute)
+        recorder.record_reading(SensorReading("south_window", 0.0, at))
+        recorder.record_reading(SensorReading("living_room", 0.0, at))
+    recorder.close()
+
+    write_plots(load_readings(path, CONFIG), CONFIG, tmp_path / "out")
+
+    symlog = [(axis, linthresh) for axis, value, linthresh in scales
+              if value == "symlog"]
+
+    assert ("y", 1) in symlog, "timeseries and scatter y axes must be symlog"
+    assert ("x", 1) in symlog, "scatter x axis must be symlog"
+    assert not any(value == "log" for _, value, _ in scales), (
+        "a plain log axis silently drops 0-lux readings"
+    )
