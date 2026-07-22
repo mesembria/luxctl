@@ -14,6 +14,18 @@ from luxctl.shell.config import Config, load_config
 
 RESAMPLE = "1min"
 
+# Daylight is selected from the data itself rather than from sun position:
+# a window sensor reading above this is seeing daylight. 50 lux sits well
+# above a dark or artificially-lit room and well below even a heavily
+# overcast window (~1000 lux), so it separates the two cleanly without
+# needing to model sunrise and sunset.
+DAYLIGHT_THRESHOLD_LUX = 50.0
+
+# Below this many paired daylight minutes, report NaN instead of a
+# correlation. A confident-looking r drawn from a handful of points is
+# worse than an honest blank.
+MIN_DAYLIGHT_SAMPLES = 60
+
 
 def load_readings(db_path: Path, config: Config) -> pd.DataFrame:
     """Load all readings into a frame with one column per sensor.
@@ -64,25 +76,136 @@ def coverage(frame: pd.DataFrame, expected_interval_s: int) -> pd.DataFrame:
     span = frame.index.max() - frame.index.min()
     expected = span.total_seconds() / expected_interval_s + 1
 
+    # Names carry the 1-minute resampling deliberately: these are computed
+    # on per-minute means, so the extremes are not the raw peaks a reader
+    # would otherwise assume, and the count is minute-bins not readings.
     return pd.DataFrame({
-        "readings": frame.notna().sum(),
+        "minutes": frame.notna().sum(),
         "completeness": (frame.notna().sum() / expected).clip(upper=1.0),
-        "min_lux": frame.min(),
-        "max_lux": frame.max(),
+        "min_lux_1min_mean": frame.min(),
+        "max_lux_1min_mean": frame.max(),
     })
 
 
-def correlations(frame: pd.DataFrame, config: Config) -> pd.DataFrame:
-    """Pearson r for every window sensor against every room sensor."""
+def _window_and_room_ids(frame: pd.DataFrame,
+                         config: Config) -> tuple[list[str], list[str]]:
     windows = [s.id for s in config.sensors
                if s.placement == "window" and s.id in frame.columns]
     rooms = [s.id for s in config.sensors
              if s.placement == "room" and s.id in frame.columns]
+    return windows, rooms
+
+
+def correlations(frame: pd.DataFrame, config: Config) -> pd.DataFrame:
+    """Pearson r for every window sensor against every room sensor,
+    across the whole record.
+
+    This figure is CONFOUNDED and must never be read alone. Every lux
+    sensor in a house reads near zero at night, so any two of them
+    correlate strongly on the day/night envelope regardless of whether
+    the window actually predicts the room. Use daylight_correlations()
+    for the feedforward decision.
+    """
+    windows, rooms = _window_and_room_ids(frame, config)
 
     return pd.DataFrame(
         {room: {window: frame[window].corr(frame[room]) for window in windows}
          for room in rooms}
     )
+
+
+def daylight_correlations(frame: pd.DataFrame, config: Config,
+                          threshold: float = DAYLIGHT_THRESHOLD_LUX,
+                          min_samples: int = MIN_DAYLIGHT_SAMPLES) -> pd.DataFrame:
+    """Pearson r restricted to daylight hours — the figure to trust.
+
+    Daylight is selected from the data itself: rows where the window
+    sensor in question reads above `threshold`. That avoids needing sun
+    position, and it is the right restriction because the question is
+    whether the window predicts the room *when there is daylight to
+    predict from*.
+
+    A pair with fewer than `min_samples` daylight rows reports NaN rather
+    than a confident-looking number computed from a handful of points.
+    """
+    windows, rooms = _window_and_room_ids(frame, config)
+
+    result = {}
+    for room in rooms:
+        column = {}
+        for window in windows:
+            daylight = frame[frame[window] > threshold]
+            paired = daylight[[window, room]].dropna()
+            if len(paired) < min_samples:
+                column[window] = float("nan")
+            else:
+                column[window] = paired[window].corr(paired[room])
+        result[room] = column
+
+    return pd.DataFrame(result)
+
+
+def daylight_sample_counts(frame: pd.DataFrame, config: Config,
+                           threshold: float = DAYLIGHT_THRESHOLD_LUX) -> pd.DataFrame:
+    """How many paired daylight minutes each correlation rests on.
+
+    Printed beside the daylight matrix so a NaN, or a correlation drawn
+    from very few minutes, is immediately explicable.
+    """
+    windows, rooms = _window_and_room_ids(frame, config)
+
+    return pd.DataFrame({
+        room: {
+            window: len(
+                frame[frame[window] > threshold][[window, room]].dropna()
+            )
+            for window in windows
+        }
+        for room in rooms
+    })
+
+
+def artificial_light_hours(db_path: Path, config: Config) -> pd.DataFrame:
+    """How long each configured light was on across the record.
+
+    Light states are recorded precisely so room-sensor movements that were
+    not caused by daylight can be explained. Without surfacing them, a room
+    whose lamps were on for much of the run folds artificial light into its
+    correlation invisibly.
+
+    This is a summary, not a model: it flags which rooms deserve suspicion,
+    it does not attempt to subtract the lights' contribution.
+    """
+    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        raw = pd.read_sql_query(
+            "SELECT light_id, is_on, at FROM light_states ORDER BY at",
+            connection,
+            parse_dates=["at"],
+        )
+    finally:
+        connection.close()
+
+    rows = {}
+    for light in config.lights:
+        states = raw[raw["light_id"] == light.id]
+        if states.empty:
+            rows[light.id] = {"hours_on": 0.0, "transitions": 0,
+                              "recorded": False}
+            continue
+
+        # Each state persists until the next one, so the time a light spent
+        # on is the sum of the gaps that begin with an is_on row.
+        durations = states["at"].diff().shift(-1).dt.total_seconds()
+        on_seconds = durations[states["is_on"] == 1].sum()
+
+        rows[light.id] = {
+            "hours_on": round(float(on_seconds) / 3600.0, 1),
+            "transitions": int(states["is_on"].diff().abs().sum()),
+            "recorded": True,
+        }
+
+    return pd.DataFrame(rows).T
 
 
 def write_plots(frame: pd.DataFrame, config: Config, out_dir: Path) -> None:
@@ -139,7 +262,26 @@ def main() -> None:
     print("Coverage — read this first; low completeness invalidates the rest")
     print(coverage(frame, expected_interval_s=60).to_string(), "\n")
 
-    print("Pearson r, window sensors (rows) vs room sensors (columns)")
+    print(f"Artificial light — hours each light was on across the record.")
+    print("A room whose lights were on for much of the run has correlations")
+    print("contaminated by artificial light, not just daylight.")
+    print(artificial_light_hours(args.db, config).to_string(), "\n")
+
+    print("=" * 70)
+    print("DAYLIGHT-ONLY Pearson r — THIS is the feedforward decision")
+    print(f"(rows where the window sensor reads above "
+          f"{DAYLIGHT_THRESHOLD_LUX:.0f} lux)")
+    print("=" * 70)
+    print(daylight_correlations(frame, config).to_string(), "\n")
+    print("Paired daylight minutes behind each figure "
+          f"(NaN above means fewer than {MIN_DAYLIGHT_SAMPLES}):")
+    print(daylight_sample_counts(frame, config).to_string(), "\n")
+
+    print("-" * 70)
+    print("All-hours Pearson r — CONFOUNDED, shown for comparison only.")
+    print("Every sensor reads ~0 at night, so any two correlate on the")
+    print("day/night cycle alone. Do not base the decision on this.")
+    print("-" * 70)
     print(correlations(frame, config).to_string(), "\n")
 
     write_plots(frame, config, args.out)
