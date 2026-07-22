@@ -206,7 +206,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["luxctl*"]
+include = ["luxctl*", "analysis*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -281,6 +281,7 @@ git commit -m "chore: scaffold luxctl package"
 Create `tests/core/__init__.py` (empty) and `tests/core/test_types.py`:
 
 ```python
+from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
 
 import pytest
@@ -304,7 +305,7 @@ def test_sensor_reading_is_immutable():
         at=datetime(2026, 7, 21, tzinfo=timezone.utc),
     )
 
-    with pytest.raises(Exception):
+    with pytest.raises(FrozenInstanceError):
         reading.lux = 9999.0
 
 
@@ -616,10 +617,11 @@ git commit -m "feat: parse HA state objects into domain types"
   - `record_reading(reading: SensorReading) -> None`
   - `record_light(state: LightState) -> None`
   - `readings_for(sensor_id: str) -> list[SensorReading]` — ordered by `at`
+  - `lights_for(light_id: str) -> list[LightState]` — ordered by `at`
   - `last_reading_at(sensor_id: str) -> datetime | None`
   - `close() -> None`
 
-  Task 7 calls `record_reading` and `record_light`; Task 7's watchdog calls `last_reading_at`; Task 9's analysis reads the database directly with SQL.
+  Task 7 calls `record_reading` and `record_light`; Task 7's watchdog calls `last_reading_at`; Task 7's tests call `lights_for`; Task 9's analysis reads the database directly with SQL.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -690,21 +692,22 @@ def test_last_reading_at_is_none_for_silent_sensor(recorder):
 def test_records_light_state_with_brightness(recorder):
     recorder.record_light(LightState("living_room_main", True, 0.5, BASE))
 
-    rows = recorder._conn.execute(
-        "SELECT light_id, is_on, brightness FROM light_states"
-    ).fetchall()
+    states = recorder.lights_for("living_room_main")
 
-    assert rows == [("living_room_main", 1, 0.5)]
+    assert len(states) == 1
+    assert states[0].light_id == "living_room_main"
+    assert states[0].is_on is True
+    assert states[0].brightness == 0.5
+    assert states[0].at == BASE
 
 
 def test_records_light_state_when_off(recorder):
     recorder.record_light(LightState("living_room_main", False, None, BASE))
 
-    rows = recorder._conn.execute(
-        "SELECT is_on, brightness FROM light_states"
-    ).fetchall()
+    states = recorder.lights_for("living_room_main")
 
-    assert rows == [(0, None)]
+    assert states[0].is_on is False
+    assert states[0].brightness is None
 
 
 def test_storage_is_append_only(recorder):
@@ -816,6 +819,22 @@ class Recorder:
         ).fetchall()
         return [
             SensorReading(sensor_id=r[0], lux=r[1], at=datetime.fromisoformat(r[2]))
+            for r in rows
+        ]
+
+    def lights_for(self, light_id: str) -> list[LightState]:
+        rows = self._conn.execute(
+            "SELECT light_id, is_on, brightness, at FROM light_states "
+            "WHERE light_id = ? ORDER BY at",
+            (light_id,),
+        ).fetchall()
+        return [
+            LightState(
+                light_id=r[0],
+                is_on=bool(r[1]),
+                brightness=r[2],
+                at=datetime.fromisoformat(r[3]),
+            )
             for r in rows
         ]
 
@@ -1482,8 +1501,9 @@ def test_records_a_configured_light(recorder):
     )
 
     assert recorded is True
-    rows = recorder._conn.execute("SELECT light_id, brightness FROM light_states").fetchall()
-    assert rows == [("living_room_main", 1.0)]
+    states = recorder.lights_for("living_room_main")
+    assert len(states) == 1
+    assert states[0].brightness == 1.0
 
 
 def test_skips_an_unavailable_sensor(recorder):
@@ -2144,6 +2164,6 @@ Also look at the scatter plots. A high r with an obviously curved scatter means 
 
 **Out of scope, correctly.** No dispatcher, no strategies, no safety ladder, no calibration — those are Phases 1–3. `LightCommand` is not defined anywhere in this plan, which is correct: Phase 0 issues none.
 
-**Type consistency.** `SensorReading(sensor_id, lux, at)` and `LightState(light_id, is_on, brightness, at)` are used identically in Tasks 2, 3, 4, 7 and 9. `Recorder` method names (`record_reading`, `record_light`, `readings_for`, `last_reading_at`, `close`) match between Task 4's definition and Tasks 7 and 9's use. `Config` fields and its two mapping methods match between Tasks 5, 7 and 9. `HAClient`'s four methods match between Tasks 6 and 7.
+**Type consistency.** `SensorReading(sensor_id, lux, at)` and `LightState(light_id, is_on, brightness, at)` are used identically in Tasks 2, 3, 4, 7 and 9. `Recorder` method names (`record_reading`, `record_light`, `readings_for`, `lights_for`, `last_reading_at`, `close`) match between Task 4's definition and Tasks 7 and 9's use. `Config` fields and its two mapping methods match between Tasks 5, 7 and 9. `HAClient`'s four methods match between Tasks 6 and 7.
 
 **Placeholder scan.** No TBDs, no "handle edge cases", no "similar to Task N". Every code step contains complete runnable code. Two values are deliberately left for a human to fill in and are marked as such at the point of use: the STEMMA QT GPIO numbers (Task 0 Step 5, unavailable from the datasheet) and the HA token in the systemd unit (Task 8 Step 1, a secret that must not be committed).
