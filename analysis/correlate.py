@@ -37,6 +37,20 @@ def load_readings(db_path: Path, config: Config) -> pd.DataFrame:
     wide = raw.pivot_table(index="at", columns="sensor_id", values="lux",
                            aggfunc="mean")
     wide = wide.resample(RESAMPLE).mean()
+
+    # pivot_table only creates a column for sensor IDs actually present in
+    # the data. A sensor configured in sensors.toml that never recorded a
+    # single reading (dead from day one, or a typo'd entity_id) would then
+    # have no column at all, and coverage()/correlations() would drop it
+    # from every report without any indication it exists. Add an all-NaN
+    # column for any such sensor so it shows up at 0% completeness instead
+    # of vanishing silently. Column order: sensors that have data keep the
+    # order pivot_table produced (deterministic — pivot_table sorts by
+    # sensor_id); sensors with no data are appended in config order.
+    for sensor in config.sensors:
+        if sensor.id not in wide.columns:
+            wide[sensor.id] = float("nan")
+
     wide.columns.name = None
     return wide
 
@@ -78,8 +92,14 @@ def write_plots(frame: pd.DataFrame, config: Config, out_dir: Path) -> None:
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    axis = frame.plot(figsize=(14, 6), logy=True, linewidth=0.8)
-    axis.set_ylabel("lux (log scale)")
+    # A dark room legitimately reads 0 lux, and a plain log axis silently
+    # drops non-positive points instead of raising, hiding genuinely dark
+    # periods from the plots. symlog with a 1-lux linear threshold keeps
+    # the log behaviour above 1 lux but still shows zero and near-zero
+    # readings. correlations() is unaffected — it works on linear values.
+    axis = frame.plot(figsize=(14, 6), linewidth=0.8)
+    axis.set_yscale("symlog", linthresh=1)
+    axis.set_ylabel("lux (symlog scale)")
     axis.set_title("Recorded illuminance")
     axis.figure.savefig(out_dir / "timeseries.png", dpi=120, bbox_inches="tight")
     plt.close(axis.figure)
@@ -93,8 +113,8 @@ def write_plots(frame: pd.DataFrame, config: Config, out_dir: Path) -> None:
         for room in rooms:
             figure, axes = plt.subplots(figsize=(6, 6))
             axes.scatter(frame[window], frame[room], s=2, alpha=0.3)
-            axes.set_xscale("log")
-            axes.set_yscale("log")
+            axes.set_xscale("symlog", linthresh=1)
+            axes.set_yscale("symlog", linthresh=1)
             axes.set_xlabel(f"{window} (lux)")
             axes.set_ylabel(f"{room} (lux)")
             axes.set_title(f"r = {frame[window].corr(frame[room]):.3f}")

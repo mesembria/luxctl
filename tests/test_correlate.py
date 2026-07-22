@@ -8,7 +8,7 @@ from luxctl.core.types import SensorReading
 from luxctl.shell.config import Config, SensorConfig
 from luxctl.shell.recorder import Recorder
 
-from analysis.correlate import coverage, load_readings
+from analysis.correlate import coverage, correlations, load_readings, write_plots
 
 BASE = datetime(2026, 7, 21, 10, 0, tzinfo=timezone.utc)
 
@@ -17,6 +17,20 @@ CONFIG = Config(
     sensors=(
         SensorConfig("south_window", "sensor.south_window_lux", "window"),
         SensorConfig("living_room", "sensor.living_room_lux", "room"),
+    ),
+    lights=(),
+    stale_after_s=600,
+)
+
+# A sensor configured in sensors.toml but which never recorded a single
+# reading — dead from day one, or a typo'd entity_id. It must still show up
+# everywhere, at 0% completeness, rather than vanishing silently.
+CONFIG_WITH_DEAD_SENSOR = Config(
+    ha_url="ws://test/api/websocket",
+    sensors=(
+        SensorConfig("south_window", "sensor.south_window_lux", "window"),
+        SensorConfig("living_room", "sensor.living_room_lux", "room"),
+        SensorConfig("dead_sensor", "sensor.dead_lux", "window"),
     ),
     lights=(),
     stale_after_s=600,
@@ -78,3 +92,48 @@ def test_coverage_detects_a_missing_sensor_period(tmp_path):
     result = coverage(frame, expected_interval_s=60)
 
     assert result.loc["living_room", "completeness"] == pytest.approx(0.5, abs=0.05)
+
+
+def test_sensor_with_zero_readings_still_gets_a_column(db):
+    frame = load_readings(db, CONFIG_WITH_DEAD_SENSOR)
+
+    assert "dead_sensor" in frame.columns
+    assert frame["dead_sensor"].isna().all()
+
+
+def test_sensor_with_zero_readings_reports_zero_completeness(db):
+    frame = load_readings(db, CONFIG_WITH_DEAD_SENSOR)
+
+    result = coverage(frame, expected_interval_s=60)
+
+    assert "dead_sensor" in result.index
+    assert result.loc["dead_sensor", "completeness"] == pytest.approx(0.0)
+
+
+def test_sensor_with_zero_readings_yields_nan_correlation_not_a_number(db):
+    frame = load_readings(db, CONFIG_WITH_DEAD_SENSOR)
+
+    result = correlations(frame, CONFIG_WITH_DEAD_SENSOR)
+
+    assert "dead_sensor" in result.index
+    assert pd.isna(result.loc["dead_sensor", "living_room"])
+
+
+def test_write_plots_handles_zero_lux_readings_without_error(tmp_path):
+    path = tmp_path / "dark.db"
+    recorder = Recorder(path)
+    for minute in range(10):
+        at = BASE + timedelta(minutes=minute)
+        # A genuinely dark room/window: legitimate 0-lux readings that a
+        # plain log axis would silently drop.
+        recorder.record_reading(SensorReading("south_window", 0.0, at))
+        recorder.record_reading(SensorReading("living_room", 0.0, at))
+    recorder.close()
+
+    frame = load_readings(path, CONFIG)
+    out_dir = tmp_path / "out"
+
+    write_plots(frame, CONFIG, out_dir)
+
+    assert (out_dir / "timeseries.png").exists()
+    assert (out_dir / "scatter_south_window_vs_living_room.png").exists()
