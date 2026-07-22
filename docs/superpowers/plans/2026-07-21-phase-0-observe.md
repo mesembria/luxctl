@@ -1751,6 +1751,9 @@ Wants=network-online.target
 Type=simple
 User=pi
 WorkingDirectory=/home/pi/luxctl
+# SUPERSEDED — do not copy this line. The unit file is tracked in git, so
+# putting the token here contradicts the rule that it never enters the repo.
+# The shipped deploy/luxctl.service uses EnvironmentFile=/etc/luxctl.env.
 Environment="LUXCTL_HA_TOKEN=REPLACE_WITH_TOKEN"
 ExecStart=/home/pi/luxctl/.venv/bin/luxctl --config sensors.toml --db data/luxctl.db
 Restart=always
