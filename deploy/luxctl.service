@@ -1,0 +1,16 @@
+[Unit]
+Description=luxctl Phase 0 recorder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/luxctl
+Environment="LUXCTL_HA_TOKEN=REPLACE_WITH_TOKEN"
+ExecStart=/home/pi/luxctl/.venv/bin/luxctl --config sensors.toml --db data/luxctl.db
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
